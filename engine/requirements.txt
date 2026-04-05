@@ -1,0 +1,8 @@
+asyncio
+aiohttp
+websockets
+python-dotenv
+solana
+pandas
+pandas-ta
+dataclasses
