@@ -37,6 +37,7 @@ apt-get install -y --no-install-recommends \
     python3.12 python3.12-venv python3.12-dev \
     python3-pip \
     sqlite3 \
+    rsync \
     git \
     fail2ban \
     ufw \
@@ -150,6 +151,7 @@ ALPHA_LOG_LEVEL=INFO
 ALPHA_LOG_DIR=/opt/alpha-engine/logs
 ALPHA_DB_PATH=/opt/alpha-engine/data/alpha_engine.db
 ALPHA_PID_FILE=/opt/alpha-engine/alpha_engine.pid
+ALPHA_BOT_CMD=/opt/alpha-engine/.venv/bin/python -m engine.main
 EOF
     warn "IMPORTANT: Edit ${ENV_FILE} before starting the services."
 else
