@@ -25,6 +25,7 @@ import json
 import logging
 import logging.handlers
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,14 +146,126 @@ def get_logger(name: str) -> logging.Logger:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SQLite bridge — tables consumed by HeartbeatMonitor
+# ──────────────────────────────────────────────────────────────────────────────
+
+_AUDIT_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS audit_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    audit_ts   TEXT    NOT NULL,
+    event      TEXT    NOT NULL,
+    token_mint TEXT,
+    raw_json   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_event ON audit_log (event);
+CREATE INDEX IF NOT EXISTS idx_audit_ts    ON audit_log (audit_ts);
+CREATE INDEX IF NOT EXISTS idx_audit_mint  ON audit_log (token_mint);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+_DB_PATH: Path | None = None
+
+
+def _get_db_path() -> Path | None:
+    """Resolve the SQLite path from env, lazily."""
+    global _DB_PATH
+    if _DB_PATH is not None:
+        return _DB_PATH
+    raw = os.getenv("ALPHA_DB_PATH", "")
+    if not raw:
+        return None
+    _DB_PATH = Path(raw)
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return _DB_PATH
+
+
+def _init_db(db: Path) -> None:
+    conn = sqlite3.connect(db)
+    conn.executescript(_AUDIT_DB_SCHEMA)
+    conn.commit()
+    conn.close()
+
+
+_db_initialized: set[str] = set()
+
+
+def _write_audit_row(event: str, token_mint: str | None, record: dict[str, Any]) -> None:
+    """Write one row to the SQLite audit_log table (silently skipped if no DB configured)."""
+    db = _get_db_path()
+    if db is None:
+        return
+    db_key = str(db)
+    if db_key not in _db_initialized:
+        _init_db(db)
+        _db_initialized.add(db_key)
+    try:
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO audit_log (audit_ts, event, token_mint, raw_json) VALUES (?,?,?,?)",
+            (record.get("audit_ts", ""), event, token_mint, json.dumps(record, default=str)),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:
+        # Do not propagate — a DB write failure must never crash the bot
+        pass
+
+
+def set_bot_state(key: str, value: Any) -> None:
+    """
+    Persist a key/value pair to the `bot_state` SQLite table so the monitor
+    can read capital and circuit-breaker state without importing the engine.
+    """
+    db = _get_db_path()
+    if db is None:
+        return
+    db_key = str(db)
+    if db_key not in _db_initialized:
+        _init_db(db)
+        _db_initialized.add(db_key)
+    try:
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """
+            INSERT INTO bot_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (key, str(value), datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Append-only audit trail
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AuditLogger:
     """
-    Write-once JSON-L audit records for every trade lifecycle event.
-    These feed both the SQLite audit table and serve as the ground truth
-    for the ML training pipeline and verifiable track record.
+    Dual-write audit trail:
+      1. Append-only JSONL flat file  — ground truth, never modified
+      2. SQLite `audit_log` table     — queried by HeartbeatMonitor in real-time
+
+    The SQLite write is best-effort: a DB failure is silently swallowed so it
+    can never crash the bot. The JSONL file is the authoritative source of truth.
+
+    Usage
+    -----
+        audit = AuditLogger()
+        audit.record_trade_open(trade_id, mint, entry, size, sl, tp, score)
+        audit.record_trade_close(trade_id, mint, exit_price, pnl, "tp_hit")
+
+        # Set observable bot state for the monitor
+        set_bot_state("circuit_breaker_active", False)
+        set_bot_state("current_capital_sol", 10.432)
     """
 
     def __init__(self, path: Path = AUDIT_LOG_FILE) -> None:
@@ -160,8 +273,15 @@ class AuditLogger:
 
     def _write(self, record: dict[str, Any]) -> None:
         record["audit_ts"] = datetime.now(timezone.utc).isoformat()
+        # 1. JSONL
         with open(self._path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
+        # 2. SQLite (best-effort)
+        _write_audit_row(
+            event      = record.get("event", "unknown"),
+            token_mint = record.get("token_mint"),
+            record     = record,
+        )
 
     def record_signal(
         self,
@@ -223,11 +343,13 @@ class AuditLogger:
         })
 
     def record_circuit_breaker(self, reason: str, portfolio_state: dict[str, Any]) -> None:
-        self._write({
+        rec = {
             "event":     "circuit_breaker_triggered",
             "reason":    reason,
             "portfolio": portfolio_state,
-        })
+        }
+        self._write(rec)
+        set_bot_state("circuit_breaker_active", True)
 
     def record_bot_event(self, event: str, detail: dict[str, Any] | None = None) -> None:
         self._write({"event": event, **(detail or {})})
