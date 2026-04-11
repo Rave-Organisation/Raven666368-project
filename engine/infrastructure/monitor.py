@@ -73,11 +73,14 @@ class MonitorConfig:
 
     db_path:      str = "data/alpha_engine.db"
     pid_file:     str = "alpha_engine.pid"
-    bot_cmd:      str = "python -m engine.main"
+    # Use explicit venv path so restart works without `python` on PATH.
+    # Override via ALPHA_BOT_CMD env var.
+    bot_cmd:      str = "/opt/alpha-engine/.venv/bin/python -m engine.main"
     wallet_pubkey: str = ""
 
     @classmethod
     def from_env(cls) -> "MonitorConfig":
+        _default_bot_cmd = "/opt/alpha-engine/.venv/bin/python -m engine.main"
         return cls(
             telegram_bot_token        = os.getenv("TELEGRAM_BOT_TOKEN",   ""),
             telegram_chat_id          = os.getenv("TELEGRAM_CHAT_ID",     ""),
@@ -87,6 +90,7 @@ class MonitorConfig:
             db_path                   = os.getenv("ALPHA_DB_PATH",        "data/alpha_engine.db"),
             wallet_pubkey             = os.getenv("SOLANA_WALLET_ADDRESS", ""),
             pid_file                  = os.getenv("ALPHA_PID_FILE",       "alpha_engine.pid"),
+            bot_cmd                   = os.getenv("ALPHA_BOT_CMD",        _default_bot_cmd),
         )
 
 
