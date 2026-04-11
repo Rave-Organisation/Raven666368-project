@@ -117,18 +117,28 @@ Sends Telegram alerts. Auto-restarts dead bot process once, then escalates.
 ## VPS Deployment
 
 ```bash
-# One-shot setup (Ubuntu 22.04 / Debian 12)
+# One-shot setup — Ubuntu 24.04 LTS required
 sudo bash vps_setup.sh
 
 # Edit /opt/alpha-engine/.env — add your real keys
-sudo systemctl start alpha-bot
-sudo systemctl start alpha-monitor
+sudo systemctl start alpha-bot.service
+sudo systemctl start alpha-monitor.service
 
 sudo journalctl -fu alpha-bot      # live bot logs
 sudo journalctl -fu alpha-monitor  # live monitor logs
+sudo ufw status verbose             # verify firewall
+sudo fail2ban-client status sshd   # verify SSH ban policy
+ls /opt/alpha-engine/backups/      # nightly SQLite backups
 ```
 
-Two systemd services run independently so a bot crash cannot silence health alerts.
+**What the script provisions (Ubuntu 24.04):**
+- Python 3.12 venv, Node.js 20 LTS
+- UFW firewall: default-deny inbound, SSH-only allowed
+- fail2ban: SSH jail (5 failures → 1h ban)
+- unattended-upgrades: auto security patches, no auto-reboot
+- Two independent systemd services (bot crash cannot silence the monitor)
+- logrotate: 30-day retention for `.log` and `.jsonl` files
+- Nightly cron: SQLite `.backup` at 02:00 UTC, 30-day backup retention
 
 ---
 
