@@ -110,16 +110,13 @@ class TelegramIngestor:
         api_hash  = os.getenv("TELEGRAM_API_HASH", "")
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         rpc_url   = os.getenv("HELIUS_RPC_URL") or os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
-        channels  = [c.strip() for c in os.getenv("SIGNAL_CHANNELS", "").split(",") if c.strip()]
+        channels_raw = os.getenv("SIGNAL_CHANNELS", "")
+        channels  = [c.strip() for c in channels_raw.split(",") if c.strip()] if channels_raw else []
 
         if not api_id or not api_hash:
             raise RuntimeError(
                 "TELEGRAM_API_ID and TELEGRAM_API_HASH must be set in Secrets. "
                 "Get them from https://my.telegram.org"
-            )
-        if not channels:
-            raise RuntimeError(
-                "SIGNAL_CHANNELS must be set — comma-separated channel usernames or IDs."
             )
 
         return cls(
@@ -141,12 +138,23 @@ class TelegramIngestor:
         session_name = "alpha_engine_session"
         client = TelegramClient(session_name, self._api_id, self._api_hash)
 
-        @client.on(events.NewMessage(chats=self._channels or None))
+        chats_filter = self._channels if self._channels else None
+        log.info("TelegramIngestor: chats_filter=%s (None = all chats)", chats_filter)
+
+        @client.on(events.NewMessage(chats=chats_filter))
         async def handle_message(event):
+            try:
+                chat = await event.get_chat()
+                sender_obj = await event.get_sender()
+                channel = str(getattr(chat, "username", None) or event.chat_id)
+                sender  = str(getattr(sender_obj, "username", None) or event.sender_id or "unknown")
+            except Exception:
+                channel = str(event.chat_id)
+                sender  = "unknown"
             await self._process_message(
                 text    = event.raw_text,
-                channel = str(getattr(await event.get_chat(), "username", event.chat_id) or event.chat_id),
-                sender  = str(getattr(await event.get_sender(), "username", event.sender_id) or "unknown"),
+                channel = channel,
+                sender  = sender,
             )
 
         if self._bot_token:
