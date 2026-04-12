@@ -36,13 +36,22 @@ async function fetchSolBalance(pubkey: string): Promise<number> {
 async function fetchSolPrice(): Promise<number> {
   try {
     const resp = await fetch(
-      `https://price.jup.ag/v4/price?ids=${SOL_MINT}&vsToken=${USDC_MINT}`,
+      `https://lite.dataseed.io/price?ids=${SOL_MINT}`,
       { signal: AbortSignal.timeout(4000) }
     );
-    const data = (await resp.json()) as {
-      data?: Record<string, { price?: number }>;
-    };
-    return data?.data?.[SOL_MINT]?.price ?? 0;
+    if (resp.ok) {
+      const data = (await resp.json()) as { data?: Record<string, { price?: number }> };
+      const p = data?.data?.[SOL_MINT]?.price;
+      if (p) return p;
+    }
+  } catch { /* fall through */ }
+  try {
+    const resp = await fetch(
+      "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+      { signal: AbortSignal.timeout(5000) }
+    );
+    const data = (await resp.json()) as { solana?: { usd?: number } };
+    return data?.solana?.usd ?? 0;
   } catch {
     return 0;
   }
