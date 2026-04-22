@@ -52,6 +52,7 @@ timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
+packages = ["cargo", "libiconv", "libxcrypt", "openssl", "pkg-config", "rustc"]
 
 [objectStorage]
 defaultBucketID = "replit-objstore-6dcd2748-cd1c-4125-a27e-5d904c22f595"
