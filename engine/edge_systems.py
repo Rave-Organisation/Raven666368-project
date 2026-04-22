@@ -7,6 +7,12 @@ to run in full feature mode without hitting the ImportError fallback.
 The rug detector is a **synchronous wrapper** around the async on-chain
 helpers in `engine/rug_checks.py`. It enforces a hard timeout and caches
 verdicts per mint so the paper engine never blocks on slow RPCs.
+
+It now wires four on-chain signals:
+  1. Mint / freeze authorities renounced
+  2. Metadata immutable (locked)
+  3. SOL liquidity in the pump.fun bonding curve
+  4. Creator's share of total supply
 """
 
 from __future__ import annotations
@@ -22,18 +28,24 @@ log = logging.getLogger(__name__)
 
 try:
     from engine.rug_checks import (
+        check_creator_supply,
+        check_liquidity_sol,
         check_metadata_authorities,
         is_metadata_locked,
     )
 except Exception:  # pragma: no cover - relative import for engine/ run dir
     try:
         from rug_checks import (  # type: ignore
+            check_creator_supply,
+            check_liquidity_sol,
             check_metadata_authorities,
             is_metadata_locked,
         )
     except Exception:
         check_metadata_authorities = None  # type: ignore
         is_metadata_locked = None  # type: ignore
+        check_liquidity_sol = None  # type: ignore
+        check_creator_supply = None  # type: ignore
 
 
 # ── Rug detector ──────────────────────────────────────────────────────────────
@@ -63,16 +75,24 @@ class _RugDetector:
       * a permissive fallback when Helius is unreachable so the paper engine
         keeps flowing — the 17-feature gate remains the primary blocker, but
         any *positive* on-chain signal is now reflected in the rug score.
+
+    Score weights (sum = 100 when all four signals participate):
+      * BASE                 = 10
+      * authorities renounced = 25
+      * metadata locked       = 15
+      * healthy liquidity     = 30  (most punitive — no LP == instant rug)
+      * creator supply ok     = 20
     """
 
-    SAFE_THRESHOLD     = 60
-    TIMEOUT_SEC        = float(os.getenv("RUG_CHECK_TIMEOUT", "2.5"))
-    CACHE_TTL_SEC      = float(os.getenv("RUG_CHECK_CACHE_TTL", "300"))
+    SAFE_THRESHOLD       = 60
+    TIMEOUT_SEC          = float(os.getenv("RUG_CHECK_TIMEOUT", "2.5"))
+    CACHE_TTL_SEC        = float(os.getenv("RUG_CHECK_CACHE_TTL", "300"))
 
-    # Score weights (sum = 100)
-    BASE_SCORE         = 30
-    W_AUTHORITIES      = 40
-    W_METADATA_LOCKED  = 30
+    BASE_SCORE           = 10
+    W_AUTHORITIES        = 25
+    W_METADATA_LOCKED    = 15
+    W_LIQUIDITY          = 30
+    W_CREATOR_SUPPLY     = 20
 
     def __init__(self) -> None:
         self._helius_url = os.getenv("HELIUS_RPC_URL", "").strip()
@@ -92,6 +112,8 @@ class _RugDetector:
         helpers_ok = (
             check_metadata_authorities is not None
             and is_metadata_locked is not None
+            and check_liquidity_sol is not None
+            and check_creator_supply is not None
         )
         active = bool(self._helius_url) and helpers_ok
         if not helpers_ok:
@@ -107,18 +129,25 @@ class _RugDetector:
             "timeout_sec": self.TIMEOUT_SEC,
             "cache_ttl_sec": self.CACHE_TTL_SEC,
             "blacklist_size": len(self._blacklist),
+            "signals": [
+                "authorities", "metadata_locked", "liquidity_sol", "creator_supply",
+            ],
         }
 
-    def check(self, mint: str) -> RugReport:
+    def check(self, mint: str, creator: str | None = None) -> RugReport:
         if not mint:
             return RugReport(score=0, safe=False, reason="empty_mint")
 
-        # Blacklist short-circuit
+        # Blacklist short-circuit — covers both mint and creator wallets.
         if mint in self._blacklist:
             return RugReport(score=0, safe=False, reason="blacklisted_mint")
+        if creator and creator in self._blacklist:
+            return RugReport(score=0, safe=False, reason="blacklisted_creator")
 
-        # Cache hit?
-        cached = self._cache_get(mint)
+        # Cache key includes the creator so a later call with creator info
+        # never reuses an earlier result that was scored without it.
+        cache_key = (mint, creator or "")
+        cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
 
@@ -126,32 +155,50 @@ class _RugDetector:
         # previous paper-mode behavior so existing runs keep working).
         if not self._helius_url or check_metadata_authorities is None:
             report = RugReport(score=85, safe=True, reason="rpc_unavailable")
-            self._cache_put(mint, report)
+            self._cache_put(cache_key, report)
             return report
 
         try:
-            report = self._run_async_with_timeout(self._evaluate(mint))
+            report = self._run_async_with_timeout(self._evaluate(mint, creator))
         except asyncio.TimeoutError:
             report = RugReport(score=70, safe=True, reason="rpc_timeout")
         except Exception as exc:  # pragma: no cover - defensive
             report = RugReport(score=70, safe=True, reason=f"rpc_error:{type(exc).__name__}")
 
-        self._cache_put(mint, report)
+        self._cache_put(cache_key, report)
         return report
 
     # ---- internals -----------------------------------------------------------
 
-    async def _evaluate(self, mint: str) -> RugReport:
-        # Run authority + metadata-lock checks concurrently for speed.
-        auth_task = asyncio.create_task(
-            check_metadata_authorities(mint, self._helius_url)
+    async def _evaluate(self, mint: str, creator: str | None = None) -> RugReport:
+        # Run all four on-chain checks concurrently for speed. Liquidity and
+        # creator-supply checks are skipped gracefully (with a "missing" reason
+        # but no negative score impact) when prerequisites aren't available.
+        tasks: list = [
+            asyncio.create_task(check_metadata_authorities(mint, self._helius_url)),
+            asyncio.create_task(is_metadata_locked(mint, self._helius_url)),
+            asyncio.create_task(check_liquidity_sol(mint, self._helius_url)),
+        ]
+        if creator and check_creator_supply is not None:
+            tasks.append(asyncio.create_task(
+                check_creator_supply(mint, creator, self._helius_url)
+            ))
+        else:
+            tasks.append(None)
+
+        results = await asyncio.gather(
+            *(t for t in tasks if t is not None), return_exceptions=True
         )
-        lock_task = asyncio.create_task(
-            is_metadata_locked(mint, self._helius_url)
-        )
-        auth_result, lock_result = await asyncio.gather(
-            auth_task, lock_task, return_exceptions=True
-        )
+        # Re-pad results so indexing matches tasks
+        padded: list = []
+        idx = 0
+        for t in tasks:
+            if t is None:
+                padded.append(None)
+            else:
+                padded.append(results[idx])
+                idx += 1
+        auth_result, lock_result, lp_result, creator_result = padded
 
         score      = self.BASE_SCORE
         reasons: list[str] = []
@@ -176,6 +223,30 @@ class _RugDetector:
                 reasons.append("metadata_mutable")
         else:
             reasons.append("metadata_check_error")
+
+        # Liquidity in pump.fun bonding curve
+        if isinstance(lp_result, tuple) and len(lp_result) == 3:
+            ok_lp, msg_lp, _lp_sol = lp_result
+            if ok_lp:
+                score += self.W_LIQUIDITY
+                reasons.append(msg_lp)
+            else:
+                reasons.append(msg_lp)
+        else:
+            reasons.append("liquidity_check_error")
+
+        # Creator supply percentage
+        if creator_result is None:
+            reasons.append("creator_unknown")
+        elif isinstance(creator_result, tuple) and len(creator_result) == 3:
+            ok_cs, msg_cs, _pct = creator_result
+            if ok_cs:
+                score += self.W_CREATOR_SUPPLY
+                reasons.append(msg_cs)
+            else:
+                reasons.append(msg_cs)
+        else:
+            reasons.append("creator_supply_check_error")
 
         score = max(0, min(100, score))
         safe  = score >= self.SAFE_THRESHOLD
