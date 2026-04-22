@@ -25,15 +25,17 @@ Replit efficiency:
   - Telegram alerts rate-limited to 1/3s
 """
 
-import os, json, asyncio, math, time, logging, csv
+import os, json, asyncio, math, time, logging, csv, tempfile
+from collections import defaultdict, deque
 from datetime import datetime, timezone
-from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, Form, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 
 # Import our systems
@@ -71,8 +73,61 @@ PAPER_LOG = os.environ.get(
     "PAPER_LOG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_trades.json"),
 )
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
 
 app = FastAPI(docs_url=None, redoc_url=None)
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> None:
+    """Dependency that enforces Bearer token authentication on sensitive routes."""
+    if not INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="API key not configured on server; set INTERNAL_API_KEY.",
+        )
+    if credentials is None or credentials.credentials != INTERNAL_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# ── Rate limiter ───────────────────────────────────────────────────────────────
+# Simple in-memory sliding-window limiter for expensive endpoints.
+# Configurable via env vars; defaults to 10 requests per 60 seconds.
+_RATE_LIMIT_REQUESTS = int(os.environ.get("HEAVY_RATE_LIMIT_REQUESTS", "10"))
+_RATE_LIMIT_WINDOW   = float(os.environ.get("HEAVY_RATE_LIMIT_WINDOW_SEC", "60"))
+_rate_windows: dict[str, deque] = defaultdict(deque)
+
+
+def _heavy_rate_limit(request: Request) -> None:
+    """
+    Sliding-window rate limit for computationally expensive endpoints.
+    Keyed by (route path + client IP) so each endpoint has its own budget.
+    """
+    key = f"{request.url.path}:{request.client.host if request.client else 'unknown'}"
+    now = time.monotonic()
+    window = _rate_windows[key]
+    cutoff = now - _RATE_LIMIT_WINDOW
+    while window and window[0] < cutoff:
+        window.popleft()
+    if len(window) >= _RATE_LIMIT_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Too many requests: max {_RATE_LIMIT_REQUESTS} per "
+                f"{int(_RATE_LIMIT_WINDOW)}s for this endpoint."
+            ),
+            headers={"Retry-After": str(int(_RATE_LIMIT_WINDOW))},
+        )
+    window.append(now)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAPER TRADE DATA MODEL
@@ -154,7 +209,7 @@ class PaperEngine:
         ) if FEATURES_LOADED else (True, self.capital * 0.05, 75, [])
 
         # Rug check
-        rug_report = rug_detector.check(mint) if FEATURES_LOADED else None
+        rug_report = rug_detector.check(mint, creator=creator) if FEATURES_LOADED else None
         rug_score  = rug_report.score if rug_report else 100
 
         breakdown = self._feature_breakdown(mint, name, symbol, transfers) if FEATURES_LOADED else ""
@@ -563,7 +618,7 @@ class HistoricalBacktester:
         """
         path = Path(csv_path)
         if not path.exists():
-            raise FileNotFoundError(f"CSV not found: {path}")
+            raise FileNotFoundError("CSV file not found")
 
         trades: list[dict] = []
         skipped = 0
@@ -932,39 +987,137 @@ async def webhook(req: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/")
+@app.get("/", dependencies=[Depends(require_api_key)])
 async def status():
     return engine.stats()
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(require_api_key)])
 async def stats():
     """Live engine state — same payload as `/`. Required by the spec."""
     return engine.stats()
 
 
-@app.get("/backtest")
+@app.get("/backtest", dependencies=[Depends(require_api_key), Depends(_heavy_rate_limit)])
 async def backtest():
     """Run historical analysis on paper trade log."""
     return backtester.run_from_paper_log(detected_count=engine.detected)
 
 
-@app.get("/backtest_csv")
-async def backtest_csv(path: str, detected: int = 0):
+MAX_CSV_BYTES = int(os.environ.get("MAX_CSV_BYTES", str(5 * 1024 * 1024)))  # 5 MB
+CSV_DOWNLOAD_TIMEOUT = float(os.environ.get("CSV_DOWNLOAD_TIMEOUT", "15"))
+
+
+def _download_csv_to_tempfile(url: str) -> str:
     """
-    Run historical analysis against a CSV of past token launches.
-
-    Query params:
-      path     — filesystem path to the CSV file
-      detected — total tokens scanned (for survivor-bias correction).
-                 Defaults to row count when omitted.
+    Stream a remote CSV into a temp file with a hard size cap.
+    Returns the temp file path on success. Raises ValueError on any failure
+    with a user-friendly message.
     """
-    if not path:
-        return JSONResponse({"error": "missing 'path' query param"}, status_code=400)
-    return backtester.run_from_csv(path, detected_count=detected)
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parsed.scheme or 'none'}")
+
+    try:
+        resp = requests.get(url, stream=True, timeout=CSV_DOWNLOAD_TIMEOUT,
+                            allow_redirects=True)
+    except requests.RequestException as exc:
+        raise ValueError(f"download failed: {exc}") from exc
+
+    if resp.status_code != 200:
+        resp.close()
+        raise ValueError(f"download failed: HTTP {resp.status_code}")
+
+    declared = resp.headers.get("Content-Length")
+    if declared and declared.isdigit() and int(declared) > MAX_CSV_BYTES:
+        resp.close()
+        raise ValueError(
+            f"CSV too large: {int(declared)} bytes > {MAX_CSV_BYTES}"
+        )
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".csv", prefix="backtest_dl_")
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > MAX_CSV_BYTES:
+                    raise ValueError(
+                        f"CSV too large: exceeded {MAX_CSV_BYTES} bytes"
+                    )
+                out.write(chunk)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        resp.close()
+
+    return tmp_path
 
 
-@app.get("/params")
+@app.get("/backtest_csv", dependencies=[Depends(require_api_key)])
+async def backtest_csv_get():
+    """
+    Server-side path access has been removed for security.
+    Use POST /backtest_csv to upload a CSV file directly.
+    """
+    return JSONResponse(
+        {"error": "Server-side path access is disabled. "
+                  "Use POST /backtest_csv to upload a CSV file directly."},
+        status_code=410,
+    )
+
+
+@app.post("/backtest_csv", dependencies=[Depends(require_api_key), Depends(_heavy_rate_limit)])
+async def backtest_csv_post(
+    file: UploadFile = File(..., description="CSV file of past launches"),
+    detected: int = Form(0),
+):
+    """
+    Upload a CSV of past launches and run the historical backtester.
+
+    Form fields:
+      file     — multipart CSV upload (max 5 MB, override via MAX_CSV_BYTES)
+      detected — total tokens scanned (defaults to row count)
+    """
+    fd, tmp_path = tempfile.mkstemp(suffix=".csv", prefix="backtest_up_")
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = await file.read(64 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_CSV_BYTES:
+                    return JSONResponse(
+                        {"error": f"upload too large: max {MAX_CSV_BYTES} bytes"},
+                        status_code=413,
+                    )
+                out.write(chunk)
+
+        if written == 0:
+            return JSONResponse({"error": "empty upload"}, status_code=400)
+
+        report = backtester.run_from_csv(tmp_path, detected_count=detected)
+        if "error" in report:
+            return JSONResponse(report, status_code=400)
+        report["uploaded_filename"] = file.filename
+        report["uploaded_bytes"]    = written
+        return report
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.get("/params", dependencies=[Depends(require_api_key), Depends(_heavy_rate_limit)])
 async def best_params():
     """Show top parameter combinations from sweep."""
     try:
@@ -975,7 +1128,7 @@ async def best_params():
         return {"error": str(e)}
 
 
-@app.get("/evolve")
+@app.get("/evolve", dependencies=[Depends(require_api_key), Depends(_heavy_rate_limit)])
 async def evolve():
     """Run self-evolution analysis and get threshold suggestions."""
     return evolution.auto_tune() if FEATURES_LOADED else {"error": "features not loaded"}
@@ -1009,39 +1162,35 @@ async def tg_commands():
                     _tg_send(json.dumps(engine.stats(), indent=2))
                 elif text == "/backtest":
                     r2 = backtester.run_from_paper_log(detected_count=engine.detected)
-                    if "error" in r2:
-                        _tg_send(f"📊 *Backtest*\n`{r2['error']}`")
-                    else:
-                        params = r2.get("best_params", []) or []
-                        params_lines = "\n".join(
-                            f"  {i+1}. tp=`{p.get('tp')}` sl=`{p.get('sl')}` "
-                            f"min_score=`{p.get('min_score')}` "
-                            f"wr=`{p.get('win_rate')}%` "
-                            f"exp=`{p.get('expectancy')}`"
-                            for i, p in enumerate(params[:3])
-                        ) or "  (none)"
-                        feats = r2.get("feature_stats", {}) or {}
-                        feat_lines = "\n".join(
-                            f"  • `{k}`: `{v}`" for k, v in list(feats.items())[:5]
-                        ) or "  (none)"
+                    _tg_send(_format_backtest_msg("📊 *Backtest Results*", r2))
+                elif text.startswith("/backtest_csv"):
+                    raw = msg.get("text", "").strip()
+                    parts = raw.split(maxsplit=1)
+                    if len(parts) != 2 or not parts[1].strip():
                         _tg_send(
-                            f"📊 *Backtest Results*\n"
-                            f"Trades: `{r2.get('total_trades', 0)}` "
-                            f"(detected: `{r2.get('detected_count', 0)}`, "
-                            f"phantoms: `{r2.get('phantom_losses', 0)}`)\n"
-                            f"Win Rate: `{r2.get('win_rate_pct', 0)}%` "
-                            f"(true: `{r2.get('win_rate_true_pct', 0)}%`)\n"
-                            f"Expectancy: `{r2.get('expectancy_sol', 0)} SOL` "
-                            f"(true: `{r2.get('expectancy_true_sol', 0)} SOL`)\n"
-                            f"Total PnL: `{r2.get('total_pnl_sol', 0)} SOL` "
-                            f"(ROI `{r2.get('roi_pct', 0)}%`)\n"
-                            f"Sharpe: `{r2.get('sharpe_ratio', 0)}` | "
-                            f"Max DD: `{r2.get('max_drawdown_pct', 0)}%`\n"
-                            f"\n*Top 3 Parameter Sets:*\n{params_lines}\n"
-                            f"\n*Feature Effectiveness:*\n{feat_lines}\n"
-                            f"\n*Verdict:* {r2.get('verdict', '—')}\n"
-                            f"Ready for LIVE: `{r2.get('ready_for_live', False)}`"
+                            "📥 *Backtest CSV*\n"
+                            "Usage: `/backtest_csv <url>`\n"
+                            "URL must point to a CSV (max "
+                            f"`{MAX_CSV_BYTES // 1024} KB`)."
                         )
+                    else:
+                        url = parts[1].strip()
+                        _tg_send(f"📥 Downloading CSV from `{url[:60]}` …")
+                        try:
+                            tmp = await asyncio.to_thread(
+                                _download_csv_to_tempfile, url
+                            )
+                        except ValueError as exc:
+                            _tg_send(f"❌ *CSV download failed*\n`{exc}`")
+                        else:
+                            try:
+                                r2 = backtester.run_from_csv(tmp)
+                            finally:
+                                try: os.unlink(tmp)
+                                except OSError: pass
+                            _tg_send(_format_backtest_msg(
+                                f"📊 *CSV Backtest* `{url[-40:]}`", r2
+                            ))
                 elif text == "/evolve":
                     s = evolution.auto_tune() if FEATURES_LOADED else {}
                     _tg_send(f"🧬 *Evolution*\n`{json.dumps(s, indent=2)}`")
@@ -1053,6 +1202,41 @@ async def tg_commands():
 @app.on_event("startup")
 async def start_tg():
     asyncio.create_task(tg_commands())
+
+
+def _format_backtest_msg(title: str, r2: dict) -> str:
+    """Render a backtester report dict into a Telegram-Markdown message."""
+    if "error" in r2:
+        return f"{title}\n`{r2['error']}`"
+    params = r2.get("best_params", []) or []
+    params_lines = "\n".join(
+        f"  {i+1}. tp=`{p.get('tp')}` sl=`{p.get('sl')}` "
+        f"min_score=`{p.get('min_score')}` "
+        f"wr=`{p.get('win_rate')}%` exp=`{p.get('expectancy')}`"
+        for i, p in enumerate(params[:3])
+    ) or "  (none)"
+    feats = r2.get("feature_stats", {}) or {}
+    feat_lines = "\n".join(
+        f"  • `{k}`: `{v}`" for k, v in list(feats.items())[:5]
+    ) or "  (none)"
+    return (
+        f"{title}\n"
+        f"Trades: `{r2.get('total_trades', 0)}` "
+        f"(detected: `{r2.get('detected_count', 0)}`, "
+        f"phantoms: `{r2.get('phantom_losses', 0)}`)\n"
+        f"Win Rate: `{r2.get('win_rate_pct', 0)}%` "
+        f"(true: `{r2.get('win_rate_true_pct', 0)}%`)\n"
+        f"Expectancy: `{r2.get('expectancy_sol', 0)} SOL` "
+        f"(true: `{r2.get('expectancy_true_sol', 0)} SOL`)\n"
+        f"Total PnL: `{r2.get('total_pnl_sol', 0)} SOL` "
+        f"(ROI `{r2.get('roi_pct', 0)}%`)\n"
+        f"Sharpe: `{r2.get('sharpe_ratio', 0)}` | "
+        f"Max DD: `{r2.get('max_drawdown_pct', 0)}%`\n"
+        f"\n*Top 3 Parameter Sets:*\n{params_lines}\n"
+        f"\n*Feature Effectiveness:*\n{feat_lines}\n"
+        f"\n*Verdict:* {r2.get('verdict', '—')}\n"
+        f"Ready for LIVE: `{r2.get('ready_for_live', False)}`"
+    )
 
 
 def _tg_send(msg: str) -> None:
